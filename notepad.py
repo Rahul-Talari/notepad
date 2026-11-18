@@ -494,6 +494,46 @@ def safe_filename(name):
     return name[:60] or "Untitled"
 
 
+def split_marks_at(line, col):
+    """Where and how to break a line at `col` without breaking inline styles.
+
+    Returns (insert_col, closers, openers): insert the paragraph break at
+    insert_col, preceded by `closers` and followed by `openers`, so bold /
+    italic / strikethrough text stays styled on both sides."""
+    spans = []
+    for mark in ("**", "~~", "*"):
+        for m in WRAP_RULES[mark].finditer(line):
+            a, z, n = m.start(), m.end(), len(mark)
+            if a < col < z:
+                spans.append((a, z, n, mark))
+    insert = col
+    # cursor at the edge of a span's text: break outside the hidden markers
+    for a, z, n, mark in spans:
+        if insert == z - n:
+            insert = z
+        elif insert == a + n:
+            insert = a
+    inside = sorted((s for s in spans if s[0] + s[2] < insert < s[1] - s[2]), key=lambda s: s[0])
+    closers = "".join(s[3] for s in reversed(inside))
+    openers = "".join(s[3] for s in inside)
+    return insert, closers, openers
+
+
+EMPTY_PAIRS = ("******", "****", "~~~~", "**")
+
+
+def empty_pair_at(text, pos):
+    """If deleting left an empty style pair (e.g. '****') around pos, return its range."""
+    for pair in EMPTY_PAIRS:
+        half = len(pair) // 2
+        a, z = pos - half, pos + half
+        if a >= 0 and text[a:z] == pair:
+            if pair == "**" and ((a > 0 and text[a - 1] == "*") or (z < len(text) and text[z] == "*")):
+                continue
+            return a, z
+    return None
+
+
 # --------------------------------------------------------------------------
 # Settings
 # --------------------------------------------------------------------------
@@ -610,12 +650,12 @@ class MarkdownFormatter:
         b.remove_tag(self.ghost, s, e)
         l0, l1 = lines
         it = b.get_iter_at_offset
+        # Like Windows 11 Notepad, syntax stays hidden on every line, including
+        # the one being edited ("Markdown syntax" view shows it).
         for a, z, ln in self.markers:
-            if not (l0 <= ln <= l1):
-                b.apply_tag(self.hidden, it(a), it(z))
+            b.apply_tag(self.hidden, it(a), it(z))
         for a, z, ln in self.ghosts:
-            if not (l0 <= ln <= l1):
-                b.apply_tag(self.ghost, it(a), it(z))
+            b.apply_tag(self.ghost, it(a), it(z))
         # paragraph breaks: show k // 2 of every k blank lines, never hiding
         # the line the cursor is on
         for run in self.runs:
@@ -702,6 +742,9 @@ class Document(Gtk.ScrolledWindow):
         click.connect("pressed", self.on_click)
         self.view.add_controller(click)
 
+        self.pending = None      # (offset, marks) style to apply to typed text
+        self._adjusting = False
+        self.buffer.connect("insert-text", self.on_insert_text)
         self.buffer.connect("changed", self.on_changed)
         self.buffer.connect("modified-changed", self.on_modified_changed)
         self.buffer.connect("notify::cursor-position", self.on_cursor)
@@ -820,8 +863,14 @@ class Document(Gtk.ScrolledWindow):
                 le.forward_to_line_end()
             line = b.get_text(ls, le, True)
             base = ls.get_offset()
-            span = find_wrap_span(line, mark, it.get_line_offset())
+            col = it.get_line_offset()
+            span = find_wrap_span(line, mark, col)
             n = len(mark)
+            if span and self.formatting_wanted() and col in (span[1] - n, span[1]):
+                # at the end of styled text: stop the style for further typing
+                self.pending = None
+                b.place_cursor(b.get_iter_at_offset(base + span[1]))
+                return
             if span:
                 a, z = span
                 inner = line[a + n:z - n]
@@ -845,6 +894,15 @@ class Document(Gtk.ScrolledWindow):
                 b.place_cursor(b.get_iter_at_offset(pos))
                 return
             off = it.get_offset()
+            if self.formatting_wanted():
+                # like Windows: the style applies to what is typed next
+                if self.pending and self.pending[0] == off and mark in self.pending[1]:
+                    marks = self.pending[1].replace(mark, "", 1)
+                    self.pending = (off, marks) if marks else None
+                else:
+                    prev = self.pending[1] if self.pending and self.pending[0] == off else ""
+                    self.pending = (off, prev + mark)
+                return
             self.replace_range(off, off, mark + mark, off + n, off + n)
             return
         full = self.get_text()
@@ -901,9 +959,113 @@ class Document(Gtk.ScrolledWindow):
 
     def on_mark_set(self, buf, it, mark):
         if mark == buf.get_selection_bound() or mark == buf.get_insert():
+            if mark == buf.get_insert():
+                if self.pending and it.get_offset() != self.pending[0]:
+                    self.pending = None
+                self.skip_hidden_prefix(it)
             if self.formatter.active:
                 self.formatter.update_hidden(self.cursor_lines())
             self.win.update_status(self)
+
+    def skip_hidden_prefix(self, it):
+        """Keep the cursor after a hidden line prefix ('# ', '> ', '\\'), so
+        typing at the start of a heading stays in the heading."""
+        if self._adjusting or not self.formatter.active or self.buffer.get_has_selection():
+            return
+        hidden = self.formatter.hidden
+        if not it.starts_line() or not it.has_tag(hidden) or it.ends_line():
+            return
+        end = it.copy()
+        end.forward_to_tag_toggle(hidden)
+        if end.get_line() != it.get_line():
+            return
+        self._adjusting = True
+        self.buffer.place_cursor(end)
+        self._adjusting = False
+
+    def on_insert_text(self, buf, location, text, length):
+        """Apply a pending style (Ctrl+B with nothing selected) to typed text."""
+        if not self.pending or self._adjusting or "\n" in text:
+            return
+        off, marks = self.pending
+        if location.get_offset() != off:
+            return
+        self.pending = None
+        GLib.idle_add(self._apply_pending, off, len(text), marks)
+
+    def _apply_pending(self, off, n, marks):
+        closing = marks[::-1]
+        b = self.buffer
+        if off + n > b.get_char_count():
+            return False
+        typed = b.get_text(b.get_iter_at_offset(off), b.get_iter_at_offset(off + n), True)
+        self._adjusting = True
+        self.replace_range(off, off + n, marks + typed + closing)
+        cur = off + len(marks) + n
+        b.place_cursor(b.get_iter_at_offset(cur))
+        self._adjusting = False
+        self.schedule_format(0)
+        return False
+
+    def _hidden_at(self, offset):
+        b = self.buffer
+        if offset < 0 or offset >= b.get_char_count():
+            return False
+        it = b.get_iter_at_offset(offset)
+        return it.has_tag(self.formatter.hidden) and it.get_char() != "\n"
+
+    def delete_visible(self, backward):
+        """Backspace/Delete that skip hidden syntax and delete the visible
+        character next to it.
+
+        Returns (handled, offset): when not handled, `offset` is where the
+        cursor effectively is once hidden syntax is skipped."""
+        b = self.buffer
+        text = self.get_text()
+        o = b.get_iter_at_mark(b.get_insert()).get_offset()
+        line_start = text.rfind("\n", 0, o) + 1
+        if backward:
+            p = o
+            if o == line_start:
+                # cursor parked before a hidden line prefix: treat it as after it
+                while self._hidden_at(p):
+                    p += 1
+            q = p
+            while q > line_start and self._hidden_at(q - 1):
+                q -= 1
+            if q == p:
+                return False, o
+            prefix = RE_LINE_PREFIX.match(text[q:p]) if q == line_start else None
+            if prefix and prefix.end() > 0:
+                # Backspace at the start of a heading/quote turns it into normal text
+                self.replace_range(q, q + prefix.end(), "", q, q)
+                self.schedule_format(0)
+                return True, o
+            if q == line_start:
+                return False, line_start
+            s = b.get_iter_at_offset(q)
+            s.backward_cursor_position()
+            a, z = s.get_offset(), q
+        else:
+            q = o
+            while self._hidden_at(q):
+                q += 1
+            if q == o or q >= len(text) or text[q] == "\n":
+                return False, q
+            e = b.get_iter_at_offset(q)
+            e.forward_cursor_position()
+            a, z = q, e.get_offset()
+        b.begin_user_action()
+        b.delete(b.get_iter_at_offset(a), b.get_iter_at_offset(z))
+        rest = self.get_text()
+        pair = empty_pair_at(rest, a)
+        if pair:
+            b.delete(b.get_iter_at_offset(pair[0]), b.get_iter_at_offset(pair[1]))
+            a = pair[0]
+        b.end_user_action()
+        b.place_cursor(b.get_iter_at_offset(a))
+        self.schedule_format(0)
+        return True, a
 
     def on_key(self, ctrl, keyval, keycode, state):
         """Windows 11 Notepad paragraph editing in Markdown formatted view.
@@ -927,24 +1089,45 @@ class Document(Gtk.ScrolledWindow):
         it = b.get_iter_at_mark(b.get_insert())
         if it.has_tag(b.get_tag_table().lookup("codeblock")):
             return False
-        o = it.get_offset()
-        if keyval == Gdk.KEY_BackSpace:
-            a, z = o - 2, o
-        else:
-            a, z = o, o + 2
-        if a < 0 or z > b.get_char_count():
-            return False
-        if b.get_text(b.get_iter_at_offset(a), b.get_iter_at_offset(z), True) != "\n\n":
-            return False
+        backward = keyval == Gdk.KEY_BackSpace
+        handled, o = self.delete_visible(backward)
+        if handled:
+            return True
+        a, z = (o - 2, o) if backward else (o, o + 2)
+        total = b.get_char_count()
+        is_break = (0 <= a and z <= total and
+                    b.get_text(b.get_iter_at_offset(a), b.get_iter_at_offset(z), True) == "\n\n")
+        if not is_break:
+            # delete one visible character (a whole emoji/accented letter)
+            edge = b.get_iter_at_offset(o)
+            if backward:
+                if not edge.backward_cursor_position():
+                    return True
+                a, z = edge.get_offset(), o
+            else:
+                if not edge.forward_cursor_position():
+                    return True
+                a, z = o, edge.get_offset()
         b.begin_user_action()
         b.delete(b.get_iter_at_offset(a), b.get_iter_at_offset(z))
+        if not is_break:
+            # deleting the last letter of bold/italic text: drop the empty markers too
+            pair = empty_pair_at(self.get_text(), a)
+            if pair:
+                b.delete(b.get_iter_at_offset(pair[0]), b.get_iter_at_offset(pair[1]))
+                a = pair[0]
         b.end_user_action()
+        b.place_cursor(b.get_iter_at_offset(a))
         self.view.scroll_mark_onscreen(b.get_insert())
         self.schedule_format(0)
         return True
 
     def smart_enter(self):
         b = self.buffer
+        if b.get_has_selection():
+            b.begin_user_action()
+            b.delete_selection(True, True)
+            b.end_user_action()
         it = b.get_iter_at_mark(b.get_insert())
         if it.has_tag(b.get_tag_table().lookup("codeblock")):
             return False
@@ -973,7 +1156,13 @@ class Document(Gtk.ScrolledWindow):
                 prefix = f"{mn.group(1)}{int(num) + 1}{mn.group(2)[-1]} "
             self.insert_text("\n" + prefix)
             return True
-        self.insert_text("\n\n")
+        # keep bold/italic/strike text styled on both sides of the break
+        ins, closers, openers = split_marks_at(line, it.get_line_offset())
+        pos = ls.get_offset() + ins
+        text = closers + "\n\n" + openers
+        self.replace_range(pos, pos, text)
+        b.place_cursor(b.get_iter_at_offset(pos + len(text)))
+        self.view.scroll_mark_onscreen(b.get_insert())
         self.schedule_format(0)
         return True
 
@@ -1603,7 +1792,15 @@ class NotepadWindow(Adw.ApplicationWindow):
             return
         b = d.buffer
         it = b.get_iter_at_mark(b.get_insert())
-        self.pos_label.set_text(f"Ln {it.get_line() + 1}, Col {it.get_line_offset() + 1}")
+        col = it.get_line_offset()
+        if d.formatter.active and col:
+            # count only visible characters, like Windows Notepad
+            ls = it.copy()
+            ls.set_line_offset(0)
+            before = b.get_text(ls, it, True)
+            visible = b.get_text(ls, it, False)
+            col = len(visible) if len(visible) <= len(before) else col
+        self.pos_label.set_text(f"Ln {it.get_line() + 1}, Col {col + 1}")
         total = b.get_char_count()
         sel = b.get_selection_bounds()
         if sel:

@@ -89,6 +89,21 @@ def test_toggle_wrap():
     assert toggle("# Head", "# Head", "**") == "# **Head**"
 
 
+def test_enter_keeps_styles():
+    line = "say **bold text** ok"
+    assert n.split_marks_at(line, line.index("text")) == (line.index("text"), "**", "**")
+    assert n.split_marks_at(line, line.index(" ok")) == (line.index(" ok"), "", "")
+    assert n.split_marks_at(line, line.index("bold")) == (line.index("**bold"), "", "")
+    nested = "**bold *it al* x**"
+    assert n.split_marks_at(nested, nested.index(" al")) == (nested.index(" al"), "***", "***")
+
+
+def test_empty_style_pairs():
+    assert n.empty_pair_at("a****b", 3) == (1, 5)
+    assert n.empty_pair_at("a**b", 2) == (1, 3)
+    assert n.empty_pair_at("a***b", 2) is None
+
+
 def test_line_transforms():
     assert n.set_heading_lines(["hello"], 2) == ["## hello"]
     assert n.set_heading_lines(["### hello"], 0) == ["hello"]
